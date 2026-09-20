@@ -1,32 +1,21 @@
-export interface Env {
-  FILES_BUCKET:
-    R2Bucket;
+import {
+  cancelRunningFileOperation,
+  claimFileOperation,
+  completeFileOperation,
+  failFileOperation,
+  getFileOperation,
+  isFileOperationCancelRequested,
+} from "./supabase";
 
-  FILE_OPERATIONS_QUEUE:
-    Queue<SystemQueueMessage>;
+import {
+  runExtractZipOperation,
+  type ExtractZipPayload,
+} from "./operations/extract-zip";
 
-  EMBERNIX_INTERNAL_SECRET:
-    string;
-}
-
-type SystemQueueMessage =
-  | {
-      type:
-        "ping";
-
-      createdAt:
-        string;
-
-      message:
-        string;
-    }
-  | {
-      type:
-        "file_operation";
-
-      operationId:
-        string;
-    };
+import type {
+  Env,
+  SystemQueueMessage,
+} from "./types";
 
 export default {
   async fetch(
@@ -57,14 +46,11 @@ export default {
       url.pathname ===
         "/internal/test-queue"
     ) {
-      const authorized =
-        isAuthorized(
+      if (
+        !isAuthorized(
           request,
           env
-        );
-
-      if (
-        !authorized
+        )
       ) {
         return json(
           {
@@ -98,6 +84,73 @@ export default {
       });
     }
 
+    if (
+      request.method ===
+        "POST" &&
+      url.pathname ===
+        "/internal/file-operations"
+    ) {
+      if (
+        !isAuthorized(
+          request,
+          env
+        )
+      ) {
+        return json(
+          {
+            error:
+              "Unauthorized",
+          },
+          401
+        );
+      }
+
+      const payload =
+        await readJson(
+          request
+        );
+
+      const operationId =
+        typeof payload
+          .operationId ===
+          "string"
+          ? payload
+              .operationId
+              .trim()
+          : "";
+
+      if (
+        !operationId
+      ) {
+        return json(
+          {
+            error:
+              "operationId is required",
+          },
+          400
+        );
+      }
+
+      await env
+        .FILE_OPERATIONS_QUEUE
+        .send({
+          type:
+            "file_operation",
+
+          operationId,
+        });
+
+      return json({
+        success:
+          true,
+
+        queued:
+          true,
+
+        operationId,
+      });
+    }
+
     return json(
       {
         error:
@@ -117,81 +170,210 @@ export default {
       const message
       of batch.messages
     ) {
+      if (
+        message.body.type ===
+        "ping"
+      ) {
+        console.log(
+          "[system-worker] queue ping received",
+          {
+            id:
+              message.id,
+
+            createdAt:
+              message.body
+                .createdAt,
+
+            message:
+              message.body
+                .message,
+          }
+        );
+
+        message.ack();
+
+        continue;
+      }
+
       try {
-        if (
-          message.body.type ===
-          "ping"
-        ) {
-          console.log(
-            "[system-worker] queue ping received",
-            {
-              id:
-                message.id,
-
-              createdAt:
-                message.body
-                  .createdAt,
-
-              message:
-                message.body
-                  .message,
-            }
-          );
-
-          message.ack();
-
-          continue;
-        }
-
-        if (
-          message.body.type ===
-          "file_operation"
-        ) {
-          console.log(
-            "[system-worker] file operation received",
-            {
-              id:
-                message.id,
-
-              operationId:
-                message.body
-                  .operationId,
-            }
-          );
-
-          /*
-           * Real file-operation execution comes
-           * in the next slice.
-           *
-           * Do not ACK real operations yet.
-           */
-
-          message.retry({
-            delaySeconds:
-              60,
-          });
-
-          continue;
-        }
+        await processFileOperation(
+          env,
+          message.body
+            .operationId
+        );
 
         message.ack();
       } catch (
         error
       ) {
         console.error(
-          "[system-worker] queue message failed",
+          "[system-worker] file operation consumer error",
           error
         );
 
-        message.retry();
+        message.retry({
+          delaySeconds:
+            60,
+        });
       }
     }
   },
-} satisfies
-  ExportedHandler<
-    Env,
-    SystemQueueMessage
-  >;
+} satisfies ExportedHandler<
+  Env,
+  SystemQueueMessage
+>;
+
+async function processFileOperation(
+  env: Env,
+  operationId:
+    string
+) {
+  const operation =
+    await claimFileOperation(
+      env,
+      operationId
+    );
+
+  if (
+    !operation
+  ) {
+    const existing =
+      await getFileOperation(
+        env,
+        operationId
+      );
+
+    if (
+      !existing
+    ) {
+      console.warn(
+        `[system-worker] operation ${operationId} no longer exists`
+      );
+
+      return;
+    }
+
+    if (
+      existing.status ===
+        "running"
+    ) {
+      throw new Error(
+        `Operation ${operationId} is already running.`
+      );
+    }
+
+    console.log(
+      `[system-worker] operation ${operationId} already ${existing.status}`
+    );
+
+    return;
+  }
+
+  console.log(
+    `[system-worker] claimed ${operation.id} (${operation.kind})`
+  );
+
+  try {
+    if (
+      operation.kind !==
+      "extract_zip"
+    ) {
+      throw new Error(
+        `Operation kind "${operation.kind}" is not supported by the Cloudflare worker yet.`
+      );
+    }
+
+    const result =
+      await runExtractZipOperation(
+        env,
+        {
+          operationId:
+            operation.id,
+
+          websiteId:
+            operation.website_id,
+
+          payload:
+            operation.payload as ExtractZipPayload,
+        }
+      );
+
+    const cancelRequested =
+      await isFileOperationCancelRequested(
+        env,
+        operation.id
+      );
+
+    if (
+      cancelRequested ||
+      result.canceled ===
+        true
+    ) {
+      await cancelRunningFileOperation(
+        env,
+        operation.id
+      );
+
+      console.log(
+        `[system-worker] canceled ${operation.id}`
+      );
+
+      return;
+    }
+
+    await completeFileOperation(
+      env,
+      operation.id,
+      result
+    );
+
+    console.log(
+      `[system-worker] completed ${operation.id}`
+    );
+  } catch (
+    error
+  ) {
+    const message =
+      error instanceof
+        Error
+        ? error.message
+        : "Unknown file operation error.";
+
+    try {
+      const canceled =
+        await isFileOperationCancelRequested(
+          env,
+          operation.id
+        );
+
+      if (
+        canceled
+      ) {
+        await cancelRunningFileOperation(
+          env,
+          operation.id
+        );
+
+        console.log(
+          `[system-worker] canceled ${operation.id}`
+        );
+
+        return;
+      }
+    } catch {
+    }
+
+    await failFileOperation(
+      env,
+      operation.id,
+      message
+    );
+
+    console.error(
+      `[system-worker] failed ${operation.id}: ${message}`
+    );
+  }
+}
 
 async function handleHealth(
   env:
@@ -264,9 +446,10 @@ function isAuthorized(
     "Bearer ";
 
   if (
-    !authorization.startsWith(
-      prefix
-    )
+    !authorization
+      .startsWith(
+        prefix
+      )
   ) {
     return false;
   }
@@ -285,6 +468,28 @@ function isAuthorized(
       env
         .EMBERNIX_INTERNAL_SECRET
   );
+}
+
+async function readJson(
+  request:
+    Request
+): Promise<
+  Record<
+    string,
+    unknown
+  >
+> {
+  try {
+    return await request
+      .json<
+        Record<
+          string,
+          unknown
+        >
+      >();
+  } catch {
+    return {};
+  }
 }
 
 function json(
