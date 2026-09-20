@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  "name": "embernix-system-worker",
+
+  "main": "src/index.ts",
+
+  "compatibility_date": "2026-09-20",
+
+  "workers_dev": true,
+
+  "r2_buckets": [
+    {
+      "binding": "FILES_BUCKET",
+      "bucket_name": "embernix-cloud"
+    }
+  ],
+
+  "queues": {
+    "producers": [
+      {
+        "binding": "FILE_OPERATIONS_QUEUE",
+        "queue": "embernix-file-operations"
+      }
+    ],
+
+    "consumers": [
+      {
+        "queue": "embernix-file-operations",
+        "max_batch_size": 5,
+        "max_batch_timeout": 2,
+        "max_retries": 3
+      }
+    ]
+  }
+}
