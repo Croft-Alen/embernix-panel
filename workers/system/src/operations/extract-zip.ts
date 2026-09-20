@@ -901,12 +901,21 @@ async function sha256Hex(
   input:
     Uint8Array
 ) {
+  const bytes =
+    new Uint8Array(
+      input.byteLength
+    );
+
+  bytes.set(
+    input
+  );
+
   const digest =
     await crypto
       .subtle
       .digest(
         "SHA-256",
-        input
+        bytes.buffer
       );
 
   return Array.from(

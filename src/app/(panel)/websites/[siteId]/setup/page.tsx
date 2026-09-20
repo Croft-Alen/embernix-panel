@@ -6,6 +6,10 @@ import {
   SetupWizard,
 } from "@/components/setup/setup-wizard";
 
+import type {
+  WebsiteSetupProgress,
+} from "@/features/setup/types";
+
 import {
   getWebsite,
 } from "@/server/services/website-service";
@@ -41,10 +45,33 @@ export default async function SetupPage({
     notFound();
   }
 
-  const setupProgress =
+  const savedSetup =
     await getSetupProgress(
       siteId
     );
+
+  const initialSetup =
+    savedSetup ??
+    ({
+      websiteId:
+        siteId,
+
+      status:
+        website
+          .setup_status,
+
+      currentStep:
+        website
+          .setup_status ===
+        "completed"
+          ? "deploy"
+          : "source",
+
+      completedAt:
+        website
+          .setup_completed_at ??
+        undefined,
+    } satisfies WebsiteSetupProgress);
 
   return (
     <SetupWizard
@@ -55,10 +82,11 @@ export default async function SetupPage({
         website.name
       }
       defaultHostname={
-        website.default_hostname
+        website
+          .default_hostname
       }
       initialSetup={
-        setupProgress
+        initialSetup
       }
     />
   );
